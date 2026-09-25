@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Fast-L · карточки</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root { color-scheme: light dark; --bg: var(--tg-theme-bg-color, #111); --ink: var(--tg-theme-text-color, #eee); --hint: var(--tg-theme-hint-color, #999); --btn: var(--tg-theme-button-color, #2563eb); --btnink: var(--tg-theme-button-text-color, #fff); --card: var(--tg-theme-secondary-bg-color, #1c1c1e); }
+    body { margin: 0; font-family: -apple-system, system-ui, sans-serif; background: var(--bg); color: var(--ink); padding: 16px; min-height: 100vh; box-sizing: border-box; }
+    .meta { color: var(--hint); font-size: 13px; margin-bottom: 8px; }
+    .card { background: var(--card); border-radius: 16px; padding: 24px 18px; min-height: 140px; display: flex; flex-direction: column; gap: 14px; justify-content: center; }
+    .front { font-size: 26px; font-weight: 700; text-align: center; line-height: 1.25; }
+    .back { font-size: 17px; white-space: pre-wrap; border-top: 1px solid rgba(128,128,128,.3); padding-top: 12px; }
+    .row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 14px; }
+    button { border: 0; border-radius: 12px; padding: 14px 10px; font-size: 16px; background: var(--btn); color: var(--btnink); }
+    button.ghost { background: var(--card); color: var(--ink); }
+    .wide { width: 100%; margin-top: 14px; }
+    [hidden] { display: none !important; }
+    .foot { color: var(--hint); font-size: 12px; margin-top: 16px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="meta" id="meta"></div>
+  <div class="card"><div class="front" id="front">…</div><div class="back" id="back" hidden></div></div>
+  <button class="wide" id="reveal" hidden>Показать ответ</button>
+  <div class="row" id="rate" hidden><button class="ghost" data-r="1"></button><button class="ghost" data-r="2"></button><button data-r="3"></button><button data-r="4"></button></div>
+  <button class="wide ghost" id="send" hidden>Отправить оценки в Fast-L</button>
+  <div class="foot">Работает без сети. Оценки уйдут в Fast-L, когда откроешь кнопку из бота и нажмёшь «Отправить».</div>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

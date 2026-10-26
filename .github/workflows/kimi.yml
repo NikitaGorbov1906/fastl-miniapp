@@ -17,7 +17,7 @@ jobs:
       !github.event.pull_request.draft &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     concurrency:
       group: kimi-review-${{ github.repository }}-${{ github.event.pull_request.number }}
       cancel-in-progress: true
@@ -281,10 +281,41 @@ jobs:
             return out;
           }
 
+          /**
+           * The streamed answer (SSE `data:` lines) folded into one chat completion. Streaming because Node's fetch gives up
+           * when response headers take over 5 min, and a thinking model answering in one piece takes longer (26.10).
+           */
+          export function foldStream(text) {
+            let content = "";
+            let reasoning = 0;
+            let finish = null;
+            let usage = null;
+            for (const line of String(text).split("\n")) {
+              const t = line.trim();
+              if (!t.startsWith("data:")) continue;
+              const payload = t.slice(5).trim();
+              if (payload === "[DONE]") continue;
+              let chunk;
+              try {
+                chunk = JSON.parse(payload);
+              } catch {
+                continue;
+              }
+              const choice = chunk.choices?.[0] ?? {};
+              content += choice.delta?.content ?? "";
+              reasoning += String(choice.delta?.reasoning_content ?? "").length;
+              finish = choice.finish_reason ?? finish;
+              usage = chunk.usage ?? choice.usage ?? usage;
+            }
+            return { choices: [{ message: { content, reasoning_chars: reasoning }, finish_reason: finish }], usage: usage ?? {} };
+          }
+
           async function callKimi(key, model, diff, title) {
             const request = (jsonMode) =>
               JSON.stringify({
                 model,
+                stream: true,
+                stream_options: { include_usage: true },
                 max_tokens: MAX_OUTPUT_TOKENS,
                 ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
                 messages: [
@@ -294,8 +325,8 @@ jobs:
               });
             let jsonMode = true;
             for (let attempt = 1; ; attempt++) {
-              const res = await fetch(MOONSHOT_URL, { method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/json" }, body: request(jsonMode), signal: AbortSignal.timeout(480000) });
-              if (res.ok) return res.json();
+              const res = await fetch(MOONSHOT_URL, { method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/json" }, body: request(jsonMode), signal: AbortSignal.timeout(900000) });
+              if (res.ok) return foldStream(await res.text());
               // A model without JSON mode answers 400: once more without it (the prompt still asks for JSON).
               if (res.status === 400 && jsonMode && attempt === 1) { jsonMode = false; continue; }
               // The status only: an error body may echo the request.
@@ -363,7 +394,7 @@ jobs:
             const after = before === null ? null : await balance(key);
             // Measured: the balance difference (other repos' reviews at the same moment can blur it; logged, not counted).
             const billed = before !== null && after !== null && before - after > 0 ? Math.round((before - after) * 1e6) / 1e6 : null;
-            console.log(`kimi-review: finish ${choice.finish_reason ?? "?"}, answer ${String(choice.message?.content ?? "").length} chars, reasoning ${String(choice.message?.reasoning_content ?? "").length} chars, billed ${billed === null ? "n/a" : `$${billed.toFixed(4)}`}`);
+            console.log(`kimi-review: finish ${choice.finish_reason ?? "?"}, answer ${String(choice.message?.content ?? "").length} chars, reasoning ${choice.message?.reasoning_chars ?? 0} chars, billed ${billed === null ? "n/a" : `$${billed.toFixed(4)}`}`);
             const body = renderComment({ sha, review, model, usage, usd, day, pack, billed });
             await gh(`/repos/${repo}/issues/${pr}/comments`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ body }) });
             console.log(`kimi-review: ${review.verdict}, ${model}, in ${usage.prompt_tokens ?? 0} out ${usage.completion_tokens ?? 0}, $${usd.toFixed(4)}`);

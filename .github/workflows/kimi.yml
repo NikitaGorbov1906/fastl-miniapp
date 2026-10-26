@@ -1,0 +1,437 @@
+# Kimi (Moonshot) — третий ревьюер кода, только на своих репо владельца (решение 26.10).
+# КОПИЯ NikitaGorbov1906/autopilot/.github/workflows/kimi-review.yml: этот репо публичный, а публичный репо не может
+# вызвать reusable workflow из приватного autopilot. Меняется только вместе с оригиналом; allowlist тот же.
+# Без org-секрета KIMI_API_KEY ревью пропускается с notice; Kimi никогда не делает CI красным.
+name: kimi
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  review:
+    name: kimi
+    if: >-
+      github.event_name == 'pull_request' &&
+      !github.event.pull_request.draft &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: kimi-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Guard — only the owner's own repos
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          case "${REPO,,}" in
+            nikitagorbov1906/autopilot|nikitagorbov1906/learningplatformwindows12|nikitagorbov1906/assistant_app_teacher|nikitagorbov1906/fastl-miniapp) ;;
+            *) echo "::error::kimi-review refuses to run in $REPO: only the owner's own repos may send code to Kimi"; exit 1 ;;
+          esac
+      - name: Kimi review
+        env:
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DAILY_CAP_USD: ${{ vars.KIMI_DAILY_CAP_USD || '2' }}
+        run: |
+          cat > "$RUNNER_TEMP/kimi-review.mjs" <<'KIMI_SCRIPT_EOF'
+          // ---- kimi-review script (tests: autopilot test/kimi-review.test.ts extract it from here) ----
+          export const ALLOWED_REPOS = [
+            "nikitagorbov1906/autopilot",
+            "nikitagorbov1906/learningplatformwindows12",
+            "nikitagorbov1906/assistant_app_teacher",
+            "nikitagorbov1906/fastl-miniapp",
+          ];
+          export const MOONSHOT_URL = "https://api.moonshot.ai/v1/chat/completions";
+          export const MODEL_DEFAULT = "kimi-k2.7-code";
+          export const MODEL_RISKY = "kimi-k3.1-pro";
+          // $ per 1M tokens. Moonshot publishes no list price for these ids yet: deliberately high estimates, so the cap
+          // errs on the safe side; the measured cost per review is reported in the autopilot PR and these get corrected.
+          export const PRICES = {
+            "kimi-k2.7-code": { in: 1.0, out: 4.0 },
+            "kimi-k3.1-pro": { in: 3.0, out: 15.0 },
+          };
+          export const DIFF_TOKEN_BUDGET = 60000;
+          // Room for a thinking model's reasoning plus the JSON: the first real review (kimi-k3.1-pro, 26.10) spent all 8000 on
+          // reasoning and returned no answer. The cap check assumes a typical answer (TYPICAL_OUTPUT_TOKENS).
+          export const MAX_OUTPUT_TOKENS = 16000;
+          export const TYPICAL_OUTPUT_TOKENS = 6000;
+          export const BALANCE_URL = "https://api.moonshot.ai/v1/users/me/balance";
+          export const BOT_LOGIN = "github-actions[bot]";
+          export const MARKER_RE = /<!-- kimi-review v1 sha=([0-9a-f]{7,40}) -->/;
+          // GitHub stores `{` `}` inside an HTML comment as `&#123;` `&#125;` (seen on the first real review): both forms count.
+          export const USAGE_RE = /<!-- kimi-usage ((?:\{|&#123;)[^<>]*?(?:\}|&#125;)) -->/;
+          export const unescapeBraces = (s) => s.replace(/&#123;/g, "{").replace(/&#125;/g, "}");
+
+          export const repoAllowed = (repo) => ALLOWED_REPOS.includes(String(repo || "").toLowerCase());
+
+          /** Calendar day in the owner's time zone (the same day Jarvis uses). */
+          export const ownerDay = (d) => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Ho_Chi_Minh", year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+
+          // ---- secret stripping ----
+          const SECRET_FILE = /(^|\/)(\.env(\.[^/]*)?|[^/]*\.(pem|key|p12|pfx|keystore|jks)|id_(rsa|ed25519|ecdsa)[^/]*|credentials(\.json)?|secrets?\.(json|ya?ml|toml))$/i;
+          export const isSecretFile = (path) => SECRET_FILE.test(path) && !/\.example$|\.sample$|\.template$/i.test(path);
+          const SECRET_PATTERNS = [
+            /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(-----END [A-Z ]*PRIVATE KEY-----|$)/g,
+            /\bsk-ant-[A-Za-z0-9_-]{16,}/g,
+            /\bsk-(proj-)?[A-Za-z0-9_-]{20,}/g,
+            /\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}/g,
+            /\bgithub_pat_[A-Za-z0-9_]{30,}/g,
+            /\b(AKIA|ASIA)[0-9A-Z]{16}\b/g,
+            /\bAIza[0-9A-Za-z_-]{35}\b/g,
+            /\bxox[abprs]-[A-Za-z0-9-]{10,}/g,
+            /\b(sk|rk|pk)_live_[A-Za-z0-9]{16,}/g,
+            /\b\d{8,10}:AA[A-Za-z0-9_-]{30,}\b/g,
+            /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g,
+          ];
+          // key = "value" where the key names a secret: the value goes, the key stays readable for the reviewer.
+          const ASSIGNED = /((?:api[_-]?key|apikey|secret|token|passw(?:or)?d|pwd|private[_-]?key|client[_-]?secret|access[_-]?key|auth[_-]?key|bearer)[A-Za-z0-9_]{0,40}["']?\s*[:=]\s*)(["'`])([^"'`\s]{8,})\2/gi;
+          const ASSIGNED_BARE = /((?:api[_-]?key|apikey|secret|token|passw(?:or)?d|pwd|private[_-]?key|client[_-]?secret|access[_-]?key)[A-Za-z0-9_]{0,40}\s*=\s*)([A-Za-z0-9_\-+/=.]{16,})(?=\s|$)/gim;
+          const URL_CREDS = /\b([a-z][a-z0-9+.-]{0,20}:\/\/)([^\s:@/]{1,200}):([^\s@/]{1,200})@/gi;
+          const BEARER = /\b(Bearer\s+)[A-Za-z0-9_\-.=]{16,}/g;
+
+          /** Removes anything that looks like a secret. Returns the text and how many values went. */
+          export function stripSecrets(text) {
+            let count = 0;
+            let out = String(text);
+            for (const re of SECRET_PATTERNS) out = out.replace(re, () => (count++, "[REDACTED]"));
+            out = out.replace(ASSIGNED, (_m, k, q) => (count++, `${k}${q}[REDACTED]${q}`));
+            out = out.replace(ASSIGNED_BARE, (_m, k) => (count++, `${k}[REDACTED]`));
+            out = out.replace(URL_CREDS, (_m, s) => (count++, `${s}[REDACTED]@`));
+            out = out.replace(BEARER, (_m, b) => (count++, `${b}[REDACTED]`));
+            return { text: out, count };
+          }
+
+          // ---- what to send ----
+          /** Higher = riskier = reviewed first when the diff does not fit. */
+          export function riskScore(path) {
+            const p = path.toLowerCase();
+            if (/(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb|cargo\.lock|poetry\.lock|go\.sum)$|\.snap$|\.min\.(js|css)$|\.svg$|\.map$/.test(p)) return 0;
+            if (p.startsWith(".github/")) return 100;
+            if (p.startsWith("src/core/")) return 90;
+            if (/(auth|secret|token|crypt|secur|permission|access|session|login|passw|privacy|retention|delete)/.test(p)) return 80;
+            if (/(migrat|schema|\/db\/|\.sql$)/.test(p)) return 75;
+            if (/(ipc|preload|csp|\/api\/|webhook|telegram|push)/.test(p)) return 70;
+            if (/(^|\/)(test|tests|__tests__|e2e)\/|\.(test|spec)\.[a-z]+$/.test(p)) return 20;
+            if (/\.(md|mdx|txt|rst)$|^docs\//.test(p)) return 10;
+            if (/\.(ts|tsx|js|jsx|mjs|cjs|py|swift|go|rs|kt|java|sh|rb|php|c|cc|cpp|h)$/.test(p)) return 50;
+            return 40;
+          }
+
+          export const estimateTokens = (text) => Math.ceil(String(text).length / 3);
+
+          /**
+           * files: [{ path, patch?, additions, deletions }]. Secret files are never sent; the rest are redacted and
+           * packed riskiest-first into the token budget. Returns the diff text and what was left out.
+           */
+          export function buildDiff(files, budget = DIFF_TOKEN_BUDGET) {
+            const ranked = files
+              .map((f, i) => ({ ...f, score: riskScore(f.path), i }))
+              .sort((a, b) => b.score - a.score || (a.additions + a.deletions) - (b.additions + b.deletions) || a.i - b.i);
+            const parts = [];
+            const omitted = [];
+            const secretFiles = [];
+            let used = 0;
+            let redacted = 0;
+            for (const f of ranked) {
+              if (isSecretFile(f.path)) { secretFiles.push(f.path); continue; }
+              if (f.patch === undefined || f.patch === null) { omitted.push(f.path); continue; }
+              const { text, count } = stripSecrets(f.patch);
+              const chunk = `diff --git a/${f.path} b/${f.path}\n${text}\n`;
+              const cost = estimateTokens(chunk);
+              if (used + cost > budget) { omitted.push(f.path); continue; }
+              parts.push(chunk);
+              used += cost;
+              redacted += count;
+            }
+            return { diff: parts.join(""), tokens: used, reviewed: parts.length, total: files.length, omitted, secretFiles, redacted };
+          }
+
+          export const pickModel = (labels, paths) =>
+            labels.some((l) => String(l).toLowerCase() === "risk:t2") || paths.some((p) => p.startsWith("src/core/")) ? MODEL_RISKY : MODEL_DEFAULT;
+
+          export function costUsd(model, usage) {
+            const price = PRICES[model] ?? PRICES[MODEL_RISKY];
+            const input = Number(usage?.prompt_tokens) || 0;
+            const output = Number(usage?.completion_tokens) || 0;
+            return Math.round(((input * price.in + output * price.out) / 1e6) * 1e6) / 1e6;
+          }
+
+          // ---- the spend counter: kimi-usage lines in this repo's comments ----
+          export function parseUsage(body) {
+            const m = USAGE_RE.exec(String(body || ""));
+            if (!m) return null;
+            try {
+              const u = JSON.parse(unescapeBraces(m[1]));
+              return typeof u.usd === "number" && typeof u.day === "string" ? u : null;
+            } catch {
+              return null;
+            }
+          }
+
+          /** Spend of one owner day from comments written by the workflow (anyone else's lines are ignored). */
+          export function spentOn(comments, day) {
+            let usd = 0;
+            for (const c of comments) {
+              if (c?.user?.login !== BOT_LOGIN) continue;
+              const u = parseUsage(c.body);
+              if (u && u.day === day) usd += u.usd;
+            }
+            return Math.round(usd * 1e6) / 1e6;
+          }
+
+          /** This repo's share of the daily cap (the cap is for all allowed repos together). */
+          export const repoCap = (totalCap) => (Number(totalCap) > 0 ? Number(totalCap) : 2) / ALLOWED_REPOS.length;
+
+          /** null = may spend; otherwise the notice why not. `estimate` = the worst case of this one review. */
+          export function capBlock(spent, estimate, totalCap) {
+            const cap = repoCap(totalCap);
+            if (spent + estimate <= cap) return null;
+            return `daily Kimi cap reached in this repo: spent $${spent.toFixed(4)} + this review up to $${estimate.toFixed(4)} > $${cap.toFixed(2)} (KIMI_DAILY_CAP_USD $${(cap * ALLOWED_REPOS.length).toFixed(2)} / ${ALLOWED_REPOS.length} repos)`;
+          }
+
+          // ---- the answer ----
+          export const SYSTEM_PROMPT = [
+            "You are a strict senior code reviewer. You get a unified diff of one pull request.",
+            "Report only real problems: bugs, security holes, data loss, broken contracts, missing error handling that will bite.",
+            "Do not report style, naming or taste. A finding is `blocking` only when merging as is would ship a bug or a vulnerability.",
+            "Answer with ONE JSON object and nothing else:",
+            '{"verdict":"clean"|"blocking","summary_ru":"2-3 plain Russian sentences for a non-programmer owner: is it safe to merge and why",',
+            '"findings":[{"severity":"blocking"|"minor","file":"path","line":123,"title":"short English title","detail":"English explanation and fix"}]}',
+            "verdict must be `blocking` if and only if at least one finding is blocking. Empty findings = clean.",
+          ].join("\n");
+
+          /** Model output → a safe review. Unknown shapes become `error` (never a silent clean). */
+          export function parseReview(content) {
+            let raw = String(content || "").trim();
+            const fence = /```(?:json)?\s*([\s\S]*?)```/.exec(raw);
+            if (fence) raw = fence[1].trim();
+            const start = raw.indexOf("{");
+            const end = raw.lastIndexOf("}");
+            let obj;
+            try {
+              obj = JSON.parse(raw.slice(start, end + 1));
+            } catch {
+              return { verdict: "error", summary: "", findings: [] };
+            }
+            const findings = (Array.isArray(obj.findings) ? obj.findings : []).slice(0, 30).map((f) => ({
+              severity: f?.severity === "blocking" ? "blocking" : "minor",
+              file: String(f?.file ?? "").slice(0, 200),
+              line: Number.isFinite(Number(f?.line)) && Number(f.line) > 0 ? Math.floor(Number(f.line)) : null,
+              title: String(f?.title ?? "").slice(0, 200),
+              detail: String(f?.detail ?? "").slice(0, 1500),
+            }));
+            const blocking = findings.some((f) => f.severity === "blocking") || obj.verdict === "blocking";
+            return { verdict: blocking ? "blocking" : "clean", summary: String(obj.summary_ru ?? "").slice(0, 1200), findings };
+          }
+
+          /** Model text must not ping people, forge markers or break the comment. */
+          export const safeText = (s) => String(s).replace(/<!--/g, "&lt;!--").replace(/-->/g, "--&gt;").replace(/@(?=[A-Za-z0-9-])/g, "@​").replace(/\r/g, "");
+
+          export function renderComment({ sha, review, model, usage, usd, day, pack, billed = null }) {
+            const meta = { verdict: review.verdict, model, in: usage?.prompt_tokens ?? 0, out: usage?.completion_tokens ?? 0, usd, day, ...(billed === null ? {} : { billed }) };
+            const head = review.verdict === "clean" ? "### Kimi: ✅ чисто" : review.verdict === "blocking" ? "### Kimi: ⛔ есть блокирующие замечания" : "### Kimi: ⚠️ ответ не разобран";
+            const lines = [`<!-- kimi-review v1 sha=${sha} -->`, `<!-- kimi-usage ${JSON.stringify(meta)} -->`];
+            // The autopilot's reviewer marker (core/reviewers.ts): the tick counts this comment as Kimi's review of the head.
+            if (review.verdict !== "error") lines.push(`<!-- autopilot:review kimi sha=${sha} verdict=${review.verdict} -->`);
+            lines.push(head, "");
+            if (review.summary) lines.push(safeText(review.summary), "");
+            else if (review.verdict === "error") lines.push("Kimi ответил не по формату — это ревью не считается ни чистым, ни блокирующим.", "");
+            if (pack.omitted.length > 0 || pack.secretFiles.length > 0) {
+              lines.push(`Diff большой или с секретами: Kimi проверил ${pack.reviewed} из ${pack.total} файлов, самые рискованные первыми.`, "");
+            }
+            lines.push("<details><summary>Technical details</summary>", "");
+            if (review.findings.length === 0) lines.push("No findings.");
+            for (const f of review.findings) {
+              const where = f.file ? `\`${safeText(f.file)}${f.line ? `:${f.line}` : ""}\`` : "";
+              lines.push(`- **${f.severity}** ${where} — ${safeText(f.title)}${f.detail ? `\n  ${safeText(f.detail).replace(/\n/g, "\n  ")}` : ""}`);
+            }
+            lines.push("");
+            if (pack.omitted.length > 0) lines.push(`Not reviewed (budget ${DIFF_TOKEN_BUDGET} tokens or no patch): ${pack.omitted.slice(0, 40).map((p) => `\`${safeText(p)}\``).join(", ")}${pack.omitted.length > 40 ? ` … +${pack.omitted.length - 40}` : ""}`, "");
+            if (pack.secretFiles.length > 0) lines.push(`Never sent (secret files): ${pack.secretFiles.map((p) => `\`${safeText(p)}\``).join(", ")}`, "");
+            if (pack.redacted > 0) lines.push(`Redacted before sending: ${pack.redacted} secret-looking value(s).`, "");
+            lines.push(`Model \`${model}\`, tokens in ${meta.in} / out ${meta.out}, est. cost $${usd.toFixed(4)}${billed === null ? "" : `, billed $${billed.toFixed(4)}`}.`, "", "</details>");
+            return lines.join("\n");
+          }
+
+          // ---- I/O ----
+          const notice = (msg) => console.log(`::notice title=kimi-review::${msg}`);
+
+          async function gh(path, opts = {}) {
+            const res = await fetch(`https://api.github.com${path}`, {
+              ...opts,
+              headers: { authorization: `Bearer ${process.env.GH_TOKEN}`, accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28", ...(opts.headers ?? {}) },
+            });
+            if (!res.ok) throw new Error(`GitHub ${opts.method ?? "GET"} ${path.split("?")[0]}: ${res.status}`);
+            return res.json();
+          }
+
+          async function pages(path, max) {
+            const out = [];
+            for (let page = 1; page <= max; page++) {
+              const batch = await gh(`${path}${path.includes("?") ? "&" : "?"}per_page=100&page=${page}`);
+              out.push(...batch);
+              if (batch.length < 100) break;
+            }
+            return out;
+          }
+
+          /**
+           * The streamed answer (SSE `data:` lines) folded into one chat completion. Streaming because Node's fetch gives up
+           * when response headers take over 5 min, and a thinking model answering in one piece takes longer (26.10).
+           */
+          export function foldStream(text) {
+            let content = "";
+            let reasoning = 0;
+            let finish = null;
+            let usage = null;
+            for (const line of String(text).split("\n")) {
+              const t = line.trim();
+              if (!t.startsWith("data:")) continue;
+              const payload = t.slice(5).trim();
+              if (payload === "[DONE]") continue;
+              let chunk;
+              try {
+                chunk = JSON.parse(payload);
+              } catch {
+                continue;
+              }
+              const choice = chunk.choices?.[0] ?? {};
+              content += choice.delta?.content ?? "";
+              reasoning += String(choice.delta?.reasoning_content ?? "").length;
+              finish = choice.finish_reason ?? finish;
+              usage = chunk.usage ?? choice.usage ?? usage;
+            }
+            return { choices: [{ message: { content, reasoning_chars: reasoning }, finish_reason: finish }], usage: usage ?? {} };
+          }
+
+          async function callKimi(key, model, diff, title) {
+            // kimi-k3.1-pro reasoned 16000 tokens (69k chars) without an answer (26.10): ask for no thinking first.
+            const request = (jsonMode, noThinking) =>
+              JSON.stringify({
+                model,
+                stream: true,
+                stream_options: { include_usage: true },
+                max_tokens: MAX_OUTPUT_TOKENS,
+                ...(noThinking ? { thinking: { type: "disabled" } } : {}),
+                ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
+                messages: [
+                  { role: "system", content: SYSTEM_PROMPT },
+                  { role: "user", content: `PR title: ${title}\n\n${diff}` },
+                ],
+              });
+            let jsonMode = true;
+            let noThinking = true;
+            let retried = false;
+            for (;;) {
+              const res = await fetch(MOONSHOT_URL, { method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/json" }, body: request(jsonMode, noThinking), signal: AbortSignal.timeout(900000) });
+              if (res.ok) return foldStream(await res.text());
+              // 400 = a parameter this model does not take: drop the thinking switch, then JSON mode (the prompt still asks for JSON).
+              if (res.status === 400 && noThinking) { noThinking = false; continue; }
+              if (res.status === 400 && jsonMode) { jsonMode = false; continue; }
+              // The status only: an error body may echo the request.
+              if (retried || !(res.status === 429 || res.status >= 500)) throw new Error(`Moonshot answered ${res.status}`);
+              retried = true;
+              await new Promise((r) => setTimeout(r, 15000));
+            }
+          }
+
+          /** The account balance in $, or null (the measured cost of a review is the difference; logged, never required). */
+          async function balance(key) {
+            try {
+              const res = await fetch(BALANCE_URL, { headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(15000) });
+              if (!res.ok) return null;
+              const b = Number((await res.json())?.data?.available_balance);
+              return Number.isFinite(b) ? b : null;
+            } catch {
+              return null;
+            }
+          }
+
+          export async function main(env = process.env, now = new Date()) {
+            const repo = env.REPO;
+            if (!repoAllowed(repo)) {
+              console.log(`::error::kimi-review refuses to run in ${repo}: only the owner's own repos may send code to Kimi`);
+              return 1;
+            }
+            const key = env.KIMI_API_KEY;
+            if (!key) {
+              notice("KIMI_API_KEY is not set for this repo yet: skipped");
+              return 0;
+            }
+            const pr = Number(env.PR_NUMBER);
+            const pull = await gh(`/repos/${repo}/pulls/${pr}`);
+            if (pull.draft || pull.state !== "open") { notice("PR is a draft or closed: skipped"); return 0; }
+            const sha = pull.head.sha;
+            if (env.HEAD_SHA && sha !== env.HEAD_SHA) { notice("head moved: the newer run reviews it"); return 0; }
+            const prComments = await pages(`/repos/${repo}/issues/${pr}/comments`, 10);
+            if (prComments.some((c) => c?.user?.login === BOT_LOGIN && MARKER_RE.exec(c.body ?? "")?.[1] === sha)) {
+              notice(`head ${sha.slice(0, 7)} already reviewed: skipped`);
+              return 0;
+            }
+            const files = (await pages(`/repos/${repo}/pulls/${pr}/files`, 30)).map((f) => ({ path: f.filename, patch: f.patch, additions: f.additions, deletions: f.deletions }));
+            const pack = buildDiff(files);
+            if (pack.reviewed === 0) { notice("nothing reviewable in this diff: skipped"); return 0; }
+            const labels = (pull.labels ?? []).map((l) => l.name);
+            const model = pickModel(labels, files.map((f) => f.path));
+            const day = ownerDay(now);
+            const since = new Date(now.getTime() - 26 * 3600000).toISOString();
+            const recent = await pages(`/repos/${repo}/issues/comments?since=${since}`, 10);
+            const estimate = costUsd(model, { prompt_tokens: pack.tokens + 1500, completion_tokens: TYPICAL_OUTPUT_TOKENS });
+            const blocked = capBlock(spentOn(recent, day), estimate, env.DAILY_CAP_USD);
+            if (blocked) { notice(`${blocked}: skipped`); return 0; }
+            const before = await balance(key);
+            let data;
+            try {
+              data = await callKimi(key, model, pack.diff, safeText(pull.title).slice(0, 300));
+            } catch (e) {
+              notice(`Kimi call failed (${e instanceof Error ? e.message : "error"}): skipped, CI not blocked`);
+              return 0;
+            }
+            let usage = data.usage ?? {};
+            let usd = costUsd(model, usage);
+            let choice = data.choices?.[0] ?? {};
+            let review = parseReview(choice.message?.content);
+            console.log(`kimi-review: ${model} finish ${choice.finish_reason ?? "?"}, answer ${String(choice.message?.content ?? "").length} chars, reasoning ${choice.message?.reasoning_chars ?? 0} chars`);
+            let used = model;
+            // No answer from the big model (it ran out reasoning): one cheap try with the code model, both paid and counted.
+            if (review.verdict === "error" && model !== MODEL_DEFAULT && !capBlock(spentOn(recent, day) + usd, costUsd(MODEL_DEFAULT, { prompt_tokens: pack.tokens + 1500, completion_tokens: TYPICAL_OUTPUT_TOKENS }), env.DAILY_CAP_USD)) {
+              try {
+                const again = await callKimi(key, MODEL_DEFAULT, pack.diff, safeText(pull.title).slice(0, 300));
+                const u2 = again.usage ?? {};
+                usd = Math.round((usd + costUsd(MODEL_DEFAULT, u2)) * 1e6) / 1e6;
+                usage = { prompt_tokens: (Number(usage.prompt_tokens) || 0) + (Number(u2.prompt_tokens) || 0), completion_tokens: (Number(usage.completion_tokens) || 0) + (Number(u2.completion_tokens) || 0) };
+                choice = again.choices?.[0] ?? {};
+                review = parseReview(choice.message?.content);
+                used = `${model}→${MODEL_DEFAULT}`;
+                console.log(`kimi-review: ${MODEL_DEFAULT} finish ${choice.finish_reason ?? "?"}, answer ${String(choice.message?.content ?? "").length} chars`);
+              } catch (e) {
+                notice(`fallback to ${MODEL_DEFAULT} failed (${e instanceof Error ? e.message : "error"})`);
+              }
+            }
+            const after = before === null ? null : await balance(key);
+            // Measured: the balance difference (other repos' reviews at the same moment can blur it; logged, not counted).
+            const billed = before !== null && after !== null && before - after > 0 ? Math.round((before - after) * 1e6) / 1e6 : null;
+            console.log(`kimi-review: billed ${billed === null ? "n/a" : `$${billed.toFixed(4)}`}`);
+            const body = renderComment({ sha, review, model: used, usage, usd, day, pack, billed });
+            await gh(`/repos/${repo}/issues/${pr}/comments`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ body }) });
+            console.log(`kimi-review: ${review.verdict}, ${used}, in ${usage.prompt_tokens ?? 0} out ${usage.completion_tokens ?? 0}, $${usd.toFixed(4)}`);
+            return 0;
+          }
+
+          if (process.env.KIMI_REVIEW_RUN === "1") {
+            try {
+              process.exitCode = await main();
+            } catch (e) {
+              // A GitHub or network hiccup must not turn the PR red: Kimi is an extra reviewer, not CI.
+              notice(`kimi-review failed (${e instanceof Error ? e.message : "error"}): skipped`);
+            }
+          }
+          // ---- end kimi-review script ----
+          KIMI_SCRIPT_EOF
+          KIMI_REVIEW_RUN=1 node "$RUNNER_TEMP/kimi-review.mjs"

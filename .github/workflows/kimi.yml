@@ -311,12 +311,14 @@ jobs:
           }
 
           async function callKimi(key, model, diff, title) {
-            const request = (jsonMode) =>
+            // kimi-k3.1-pro reasoned 16000 tokens (69k chars) without an answer (26.10): ask for no thinking first.
+            const request = (jsonMode, noThinking) =>
               JSON.stringify({
                 model,
                 stream: true,
                 stream_options: { include_usage: true },
                 max_tokens: MAX_OUTPUT_TOKENS,
+                ...(noThinking ? { thinking: { type: "disabled" } } : {}),
                 ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
                 messages: [
                   { role: "system", content: SYSTEM_PROMPT },
@@ -324,13 +326,17 @@ jobs:
                 ],
               });
             let jsonMode = true;
-            for (let attempt = 1; ; attempt++) {
-              const res = await fetch(MOONSHOT_URL, { method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/json" }, body: request(jsonMode), signal: AbortSignal.timeout(900000) });
+            let noThinking = true;
+            let retried = false;
+            for (;;) {
+              const res = await fetch(MOONSHOT_URL, { method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/json" }, body: request(jsonMode, noThinking), signal: AbortSignal.timeout(900000) });
               if (res.ok) return foldStream(await res.text());
-              // A model without JSON mode answers 400: once more without it (the prompt still asks for JSON).
-              if (res.status === 400 && jsonMode && attempt === 1) { jsonMode = false; continue; }
+              // 400 = a parameter this model does not take: drop the thinking switch, then JSON mode (the prompt still asks for JSON).
+              if (res.status === 400 && noThinking) { noThinking = false; continue; }
+              if (res.status === 400 && jsonMode) { jsonMode = false; continue; }
               // The status only: an error body may echo the request.
-              if (attempt >= 2 || !(res.status === 429 || res.status >= 500)) throw new Error(`Moonshot answered ${res.status}`);
+              if (retried || !(res.status === 429 || res.status >= 500)) throw new Error(`Moonshot answered ${res.status}`);
+              retried = true;
               await new Promise((r) => setTimeout(r, 15000));
             }
           }
@@ -387,17 +393,34 @@ jobs:
               notice(`Kimi call failed (${e instanceof Error ? e.message : "error"}): skipped, CI not blocked`);
               return 0;
             }
-            const usage = data.usage ?? {};
-            const usd = costUsd(model, usage);
-            const choice = data.choices?.[0] ?? {};
-            const review = parseReview(choice.message?.content);
+            let usage = data.usage ?? {};
+            let usd = costUsd(model, usage);
+            let choice = data.choices?.[0] ?? {};
+            let review = parseReview(choice.message?.content);
+            console.log(`kimi-review: ${model} finish ${choice.finish_reason ?? "?"}, answer ${String(choice.message?.content ?? "").length} chars, reasoning ${choice.message?.reasoning_chars ?? 0} chars`);
+            let used = model;
+            // No answer from the big model (it ran out reasoning): one cheap try with the code model, both paid and counted.
+            if (review.verdict === "error" && model !== MODEL_DEFAULT && !capBlock(spentOn(recent, day) + usd, costUsd(MODEL_DEFAULT, { prompt_tokens: pack.tokens + 1500, completion_tokens: TYPICAL_OUTPUT_TOKENS }), env.DAILY_CAP_USD)) {
+              try {
+                const again = await callKimi(key, MODEL_DEFAULT, pack.diff, safeText(pull.title).slice(0, 300));
+                const u2 = again.usage ?? {};
+                usd = Math.round((usd + costUsd(MODEL_DEFAULT, u2)) * 1e6) / 1e6;
+                usage = { prompt_tokens: (Number(usage.prompt_tokens) || 0) + (Number(u2.prompt_tokens) || 0), completion_tokens: (Number(usage.completion_tokens) || 0) + (Number(u2.completion_tokens) || 0) };
+                choice = again.choices?.[0] ?? {};
+                review = parseReview(choice.message?.content);
+                used = `${model}→${MODEL_DEFAULT}`;
+                console.log(`kimi-review: ${MODEL_DEFAULT} finish ${choice.finish_reason ?? "?"}, answer ${String(choice.message?.content ?? "").length} chars`);
+              } catch (e) {
+                notice(`fallback to ${MODEL_DEFAULT} failed (${e instanceof Error ? e.message : "error"})`);
+              }
+            }
             const after = before === null ? null : await balance(key);
             // Measured: the balance difference (other repos' reviews at the same moment can blur it; logged, not counted).
             const billed = before !== null && after !== null && before - after > 0 ? Math.round((before - after) * 1e6) / 1e6 : null;
-            console.log(`kimi-review: finish ${choice.finish_reason ?? "?"}, answer ${String(choice.message?.content ?? "").length} chars, reasoning ${choice.message?.reasoning_chars ?? 0} chars, billed ${billed === null ? "n/a" : `$${billed.toFixed(4)}`}`);
-            const body = renderComment({ sha, review, model, usage, usd, day, pack, billed });
+            console.log(`kimi-review: billed ${billed === null ? "n/a" : `$${billed.toFixed(4)}`}`);
+            const body = renderComment({ sha, review, model: used, usage, usd, day, pack, billed });
             await gh(`/repos/${repo}/issues/${pr}/comments`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ body }) });
-            console.log(`kimi-review: ${review.verdict}, ${model}, in ${usage.prompt_tokens ?? 0} out ${usage.completion_tokens ?? 0}, $${usd.toFixed(4)}`);
+            console.log(`kimi-review: ${review.verdict}, ${used}, in ${usage.prompt_tokens ?? 0} out ${usage.completion_tokens ?? 0}, $${usd.toFixed(4)}`);
             return 0;
           }
 

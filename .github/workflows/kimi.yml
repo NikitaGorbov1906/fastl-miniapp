@@ -17,7 +17,7 @@ jobs:
       !github.event.pull_request.draft &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     concurrency:
       group: kimi-review-${{ github.repository }}-${{ github.event.pull_request.number }}
       cancel-in-progress: true
@@ -57,12 +57,16 @@ jobs:
             "kimi-k3.1-pro": { in: 3.0, out: 15.0 },
           };
           export const DIFF_TOKEN_BUDGET = 60000;
-          // Room for a thinking model's reasoning plus the JSON; the cap check assumes a typical answer (TYPICAL_OUTPUT_TOKENS).
-          export const MAX_OUTPUT_TOKENS = 8000;
-          export const TYPICAL_OUTPUT_TOKENS = 2000;
+          // Room for a thinking model's reasoning plus the JSON: the first real review (kimi-k3.1-pro, 26.10) spent all 8000 on
+          // reasoning and returned no answer. The cap check assumes a typical answer (TYPICAL_OUTPUT_TOKENS).
+          export const MAX_OUTPUT_TOKENS = 16000;
+          export const TYPICAL_OUTPUT_TOKENS = 6000;
+          export const BALANCE_URL = "https://api.moonshot.ai/v1/users/me/balance";
           export const BOT_LOGIN = "github-actions[bot]";
           export const MARKER_RE = /<!-- kimi-review v1 sha=([0-9a-f]{7,40}) -->/;
-          export const USAGE_RE = /<!-- kimi-usage (\{[^<>]*\}) -->/;
+          // GitHub stores `{` `}` inside an HTML comment as `&#123;` `&#125;` (seen on the first real review): both forms count.
+          export const USAGE_RE = /<!-- kimi-usage ((?:\{|&#123;)[^<>]*?(?:\}|&#125;)) -->/;
+          export const unescapeBraces = (s) => s.replace(/&#123;/g, "{").replace(/&#125;/g, "}");
 
           export const repoAllowed = (repo) => ALLOWED_REPOS.includes(String(repo || "").toLowerCase());
 
@@ -163,7 +167,7 @@ jobs:
             const m = USAGE_RE.exec(String(body || ""));
             if (!m) return null;
             try {
-              const u = JSON.parse(m[1]);
+              const u = JSON.parse(unescapeBraces(m[1]));
               return typeof u.usd === "number" && typeof u.day === "string" ? u : null;
             } catch {
               return null;
@@ -229,8 +233,8 @@ jobs:
           /** Model text must not ping people, forge markers or break the comment. */
           export const safeText = (s) => String(s).replace(/<!--/g, "&lt;!--").replace(/-->/g, "--&gt;").replace(/@(?=[A-Za-z0-9-])/g, "@​").replace(/\r/g, "");
 
-          export function renderComment({ sha, review, model, usage, usd, day, pack }) {
-            const meta = { verdict: review.verdict, model, in: usage?.prompt_tokens ?? 0, out: usage?.completion_tokens ?? 0, usd, day };
+          export function renderComment({ sha, review, model, usage, usd, day, pack, billed = null }) {
+            const meta = { verdict: review.verdict, model, in: usage?.prompt_tokens ?? 0, out: usage?.completion_tokens ?? 0, usd, day, ...(billed === null ? {} : { billed }) };
             const head = review.verdict === "clean" ? "### Kimi: ✅ чисто" : review.verdict === "blocking" ? "### Kimi: ⛔ есть блокирующие замечания" : "### Kimi: ⚠️ ответ не разобран";
             const lines = [`<!-- kimi-review v1 sha=${sha} -->`, `<!-- kimi-usage ${JSON.stringify(meta)} -->`];
             // The autopilot's reviewer marker (core/reviewers.ts): the tick counts this comment as Kimi's review of the head.
@@ -251,7 +255,7 @@ jobs:
             if (pack.omitted.length > 0) lines.push(`Not reviewed (budget ${DIFF_TOKEN_BUDGET} tokens or no patch): ${pack.omitted.slice(0, 40).map((p) => `\`${safeText(p)}\``).join(", ")}${pack.omitted.length > 40 ? ` … +${pack.omitted.length - 40}` : ""}`, "");
             if (pack.secretFiles.length > 0) lines.push(`Never sent (secret files): ${pack.secretFiles.map((p) => `\`${safeText(p)}\``).join(", ")}`, "");
             if (pack.redacted > 0) lines.push(`Redacted before sending: ${pack.redacted} secret-looking value(s).`, "");
-            lines.push(`Model \`${model}\`, tokens in ${meta.in} / out ${meta.out}, est. cost $${usd.toFixed(4)}.`, "", "</details>");
+            lines.push(`Model \`${model}\`, tokens in ${meta.in} / out ${meta.out}, est. cost $${usd.toFixed(4)}${billed === null ? "" : `, billed $${billed.toFixed(4)}`}.`, "", "</details>");
             return lines.join("\n");
           }
 
@@ -290,13 +294,25 @@ jobs:
               });
             let jsonMode = true;
             for (let attempt = 1; ; attempt++) {
-              const res = await fetch(MOONSHOT_URL, { method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/json" }, body: request(jsonMode), signal: AbortSignal.timeout(300000) });
+              const res = await fetch(MOONSHOT_URL, { method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/json" }, body: request(jsonMode), signal: AbortSignal.timeout(480000) });
               if (res.ok) return res.json();
               // A model without JSON mode answers 400: once more without it (the prompt still asks for JSON).
               if (res.status === 400 && jsonMode && attempt === 1) { jsonMode = false; continue; }
               // The status only: an error body may echo the request.
               if (attempt >= 2 || !(res.status === 429 || res.status >= 500)) throw new Error(`Moonshot answered ${res.status}`);
               await new Promise((r) => setTimeout(r, 15000));
+            }
+          }
+
+          /** The account balance in $, or null (the measured cost of a review is the difference; logged, never required). */
+          async function balance(key) {
+            try {
+              const res = await fetch(BALANCE_URL, { headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(15000) });
+              if (!res.ok) return null;
+              const b = Number((await res.json())?.data?.available_balance);
+              return Number.isFinite(b) ? b : null;
+            } catch {
+              return null;
             }
           }
 
@@ -332,6 +348,7 @@ jobs:
             const estimate = costUsd(model, { prompt_tokens: pack.tokens + 1500, completion_tokens: TYPICAL_OUTPUT_TOKENS });
             const blocked = capBlock(spentOn(recent, day), estimate, env.DAILY_CAP_USD);
             if (blocked) { notice(`${blocked}: skipped`); return 0; }
+            const before = await balance(key);
             let data;
             try {
               data = await callKimi(key, model, pack.diff, safeText(pull.title).slice(0, 300));
@@ -341,8 +358,13 @@ jobs:
             }
             const usage = data.usage ?? {};
             const usd = costUsd(model, usage);
-            const review = parseReview(data.choices?.[0]?.message?.content);
-            const body = renderComment({ sha, review, model, usage, usd, day, pack });
+            const choice = data.choices?.[0] ?? {};
+            const review = parseReview(choice.message?.content);
+            const after = before === null ? null : await balance(key);
+            // Measured: the balance difference (other repos' reviews at the same moment can blur it; logged, not counted).
+            const billed = before !== null && after !== null && before - after > 0 ? Math.round((before - after) * 1e6) / 1e6 : null;
+            console.log(`kimi-review: finish ${choice.finish_reason ?? "?"}, answer ${String(choice.message?.content ?? "").length} chars, reasoning ${String(choice.message?.reasoning_content ?? "").length} chars, billed ${billed === null ? "n/a" : `$${billed.toFixed(4)}`}`);
+            const body = renderComment({ sha, review, model, usage, usd, day, pack, billed });
             await gh(`/repos/${repo}/issues/${pr}/comments`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ body }) });
             console.log(`kimi-review: ${review.verdict}, ${model}, in ${usage.prompt_tokens ?? 0} out ${usage.completion_tokens ?? 0}, $${usd.toFixed(4)}`);
             return 0;

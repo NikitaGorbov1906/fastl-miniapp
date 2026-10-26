@@ -57,7 +57,9 @@ jobs:
             "kimi-k3.1-pro": { in: 3.0, out: 15.0 },
           };
           export const DIFF_TOKEN_BUDGET = 60000;
-          export const MAX_OUTPUT_TOKENS = 4000;
+          // Room for a thinking model's reasoning plus the JSON; the cap check assumes a typical answer (TYPICAL_OUTPUT_TOKENS).
+          export const MAX_OUTPUT_TOKENS = 8000;
+          export const TYPICAL_OUTPUT_TOKENS = 2000;
           export const BOT_LOGIN = "github-actions[bot]";
           export const MARKER_RE = /<!-- kimi-review v1 sha=([0-9a-f]{7,40}) -->/;
           export const USAGE_RE = /<!-- kimi-usage (\{[^<>]*\}) -->/;
@@ -230,7 +232,10 @@ jobs:
           export function renderComment({ sha, review, model, usage, usd, day, pack }) {
             const meta = { verdict: review.verdict, model, in: usage?.prompt_tokens ?? 0, out: usage?.completion_tokens ?? 0, usd, day };
             const head = review.verdict === "clean" ? "### Kimi: ✅ чисто" : review.verdict === "blocking" ? "### Kimi: ⛔ есть блокирующие замечания" : "### Kimi: ⚠️ ответ не разобран";
-            const lines = [`<!-- kimi-review v1 sha=${sha} -->`, `<!-- kimi-usage ${JSON.stringify(meta)} -->`, head, ""];
+            const lines = [`<!-- kimi-review v1 sha=${sha} -->`, `<!-- kimi-usage ${JSON.stringify(meta)} -->`];
+            // The autopilot's reviewer marker (core/reviewers.ts): the tick counts this comment as Kimi's review of the head.
+            if (review.verdict !== "error") lines.push(`<!-- autopilot:review kimi sha=${sha} verdict=${review.verdict} -->`);
+            lines.push(head, "");
             if (review.summary) lines.push(safeText(review.summary), "");
             else if (review.verdict === "error") lines.push("Kimi ответил не по формату — это ревью не считается ни чистым, ни блокирующим.", "");
             if (pack.omitted.length > 0 || pack.secretFiles.length > 0) {
@@ -273,18 +278,22 @@ jobs:
           }
 
           async function callKimi(key, model, diff, title) {
-            const body = JSON.stringify({
-              model,
-              max_tokens: MAX_OUTPUT_TOKENS,
-              response_format: { type: "json_object" },
-              messages: [
-                { role: "system", content: SYSTEM_PROMPT },
-                { role: "user", content: `PR title: ${title}\n\n${diff}` },
-              ],
-            });
+            const request = (jsonMode) =>
+              JSON.stringify({
+                model,
+                max_tokens: MAX_OUTPUT_TOKENS,
+                ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
+                messages: [
+                  { role: "system", content: SYSTEM_PROMPT },
+                  { role: "user", content: `PR title: ${title}\n\n${diff}` },
+                ],
+              });
+            let jsonMode = true;
             for (let attempt = 1; ; attempt++) {
-              const res = await fetch(MOONSHOT_URL, { method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/json" }, body, signal: AbortSignal.timeout(300000) });
+              const res = await fetch(MOONSHOT_URL, { method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/json" }, body: request(jsonMode), signal: AbortSignal.timeout(300000) });
               if (res.ok) return res.json();
+              // A model without JSON mode answers 400: once more without it (the prompt still asks for JSON).
+              if (res.status === 400 && jsonMode && attempt === 1) { jsonMode = false; continue; }
               // The status only: an error body may echo the request.
               if (attempt >= 2 || !(res.status === 429 || res.status >= 500)) throw new Error(`Moonshot answered ${res.status}`);
               await new Promise((r) => setTimeout(r, 15000));
@@ -320,7 +329,7 @@ jobs:
             const day = ownerDay(now);
             const since = new Date(now.getTime() - 26 * 3600000).toISOString();
             const recent = await pages(`/repos/${repo}/issues/comments?since=${since}`, 10);
-            const estimate = costUsd(model, { prompt_tokens: pack.tokens + 1500, completion_tokens: MAX_OUTPUT_TOKENS });
+            const estimate = costUsd(model, { prompt_tokens: pack.tokens + 1500, completion_tokens: TYPICAL_OUTPUT_TOKENS });
             const blocked = capBlock(spentOn(recent, day), estimate, env.DAILY_CAP_USD);
             if (blocked) { notice(`${blocked}: skipped`); return 0; }
             let data;
